@@ -23,6 +23,7 @@ type TickDBEntry map[key]string
 //tTickDB contains the latest and greatest time value
 type tTickDB struct {
   current TickDBEntry
+  //This design might bite me in the butt once additional collector threads are thrown in.
   historical map[key][]string
 }
 
