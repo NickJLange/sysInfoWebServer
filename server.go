@@ -3,78 +3,53 @@ package main
 import "net/http"
 import "time"
 import "log"
-import "io"
 import "context"
 import "fmt"
 import "sync"
 import "strconv"
+import "flag"
+import "os"
+import "github.com/NickJLange/monitoring"
+import "github.com/NickJLange/tickdatabase"
+import "github.com/bmizerany/perks/quantile"
 
-
-type key string
 const (
   //LatestKey Used for fun and games
-  LatestKey key = "Latest"
+  LatestKey tickdatabase.Key = "Latest"
   //MaxHistory should cap the memory size of the program - need to play with this a bit
    MaxHistory=10*60*60
 )
 
-//TickDBEntry  - Wrapper to do what I want to do
-type TickDBEntry map[key]string
-//tTickDB contains the latest and greatest time value
-type tTickDB struct {
-  current TickDBEntry
-  //This design might bite me in the butt once additional collector threads are thrown in.
-  historical map[key][]string
-}
-
 //TickDB Master Initialized in Main?
 //TickDB Can I make this a locally scoped variable?
-var TickDB tTickDB
+var TickDB tickdatabase.TTickDB
 
-
-
-//start := time.Now()
-//End = time.Since(start) (// this is really nice)
-
-func populateTemperature(TickDB tTickDB) {
-  start := time.Now()
-  smcOpen()
-  defer smcClose()
-  End := time.Since(start)
-
-  for  true {
-   start = time.Now()
-   var myLock sync.RWMutex
-   myLock.Lock()
-   x:=fmt.Sprintf("%v",readTemperature())
-
-   TickDB.current["temperature"]=fmt.Sprintf("%v",x)
-   TickDB.current["lastRun"] = fmt.Sprintf("%v", End.Nanoseconds())
-//FIXME: I'm not sure this is correct
-   TickDB.historical["temperature"] = append(TickDB.historical["temperature"],x)
-   TickDB.historical["lastRun"] = append(TickDB.historical["lastRun"],fmt.Sprintf("%v",End.Nanoseconds()))
-   myLock.Unlock()
-   End = time.Since(start)
-   fmt.Printf("It took this long to run %v\n",End)
-   time.Sleep(10*time.Second)
- }
-}
 
 
 func main() {
   //Do some hosuekeeping
-
-  TickDB.current=make(map[key]string)
-  TickDB.historical=make(map[key][]string)
+  portPtr := flag.Int("port",8008,"Listen Port")
+  ipPtr := flag.String("ip","","IP to bind on - defaults to INADDR_ANY")
+  //ifPtr := flag.String("if","","Interface to try to use - might not work on certain OS (Program will bomb.)")
+  flag.Parse()
+  //FIXME: Validate Data Quality
+  if (*portPtr < 1024 || *portPtr > 32768){
+     fmt.Printf("Invalid Port outside Daemon Range: %v", *portPtr)
+     os.Exit(-1)
+  }
+  var bindAddr = fmt.Sprintf("%s:%d",*ipPtr,*portPtr)
+  fmt.Printf("Starting up Listening to %v\n", bindAddr)
+  TickDB.Current=make(map[tickdatabase.Key]string)
+  TickDB.Historical=make(map[tickdatabase.Key][]string)
   // FML
-  go populateTemperature(TickDB)
+  go monitoring.PopulateTemperature(TickDB)
 
   mux := http.NewServeMux()
   //TODO: Why does nil work?
-  mux.HandleFunc("/temperature",reportLatestStatusWrapper(nil))
+  mux.HandleFunc("/now",reportLatestStatusWrapper(nil))
   mux.HandleFunc("/statistics", reportStatisticsWrapper(nil))
   mainServer:=http.Server {
-  Addr: ":8080",
+  Addr: bindAddr,
   Handler: mux,
   ReadTimeout: 10 * time.Second,
   WriteTimeout: 10 * time.Second,
@@ -84,16 +59,16 @@ func main() {
 
 
 
-func newContextWithLatestEntry(ctx context.Context, r *http.Request, val TickDBEntry) context.Context {
+func newContextWithLatestEntry(ctx context.Context, r *http.Request, val tickdatabase.TickDBEntry) context.Context {
   if val == nil {
    return context.TODO()
   }
  return context.WithValue(ctx, LatestKey, val)
 }
 
-func pullID(ctx context.Context) TickDBEntry {
+func pullID(ctx context.Context) tickdatabase.TickDBEntry {
 
-  return ctx.Value(LatestKey).(TickDBEntry)
+  return ctx.Value(LatestKey).(tickdatabase.TickDBEntry)
 }
 
 
@@ -102,46 +77,42 @@ func reportLatestStatusWrapper(next http.HandlerFunc) http.HandlerFunc {
     //TODO: Is this passed by value or reference?
     var myLock sync.RWMutex
     myLock.RLock()
-    latest := TickDB.current
+    latest := TickDB.Current
     myLock.RUnlock()
-    ctx := newContextWithLatestEntry(r.Context(), r, latest)
-    helloWorldHandler(w, r.WithContext(ctx))
+   // whoami := latestAndGreatest["fancy"]
+    w.Header().Set("Content-Type", "text/plain; charset=utf-8") // normal header)
+    w.WriteHeader(http.StatusOK)
+    fmt.Fprintf(w, "Current Status of: \n")
+    for k,v := range(latest){
+      fmt.Fprintf(w, "%v=%v\n",k,v)
+    }
  })
 }
 
 func reportStatisticsWrapper(next http.HandlerFunc) http.HandlerFunc {
  return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request){
+    start := time.Now()
     //TODO: Is this passed by value or reference?
     var myLock sync.RWMutex
     myLock.RLock()
-    latest := TickDB.historical
+    latest := TickDB.Historical
     myLock.RUnlock()
     w.Header().Set("Content-Type", "text/plain; charset=utf-8") // normal header)
     w.WriteHeader(http.StatusOK)
+
     for k,v := range(latest){
-      var total,sampleCount float64
+      var sampleCount float64
+      q := quantile.NewTargeted(0.0001,0.50, 0.90, 0.99,0.9999)
       for i := range(v){
             //fmt.Printf("parsing a float %v , %v\n", i, v[i])
             if f,err := strconv.ParseFloat(v[i], 64); err == nil {
-             total+= f
+             q.Insert(f)
              sampleCount++
           }
       }
-      fmt.Fprintf(w, "Statistics for %v: Total Samples %v with an Average of %v\n",k,sampleCount,(total/sampleCount))
+      fmt.Fprintf(w, "Statistics for %v across sample size %v - p1: %v, p50: %v, p90: %v, p99: %v, p99.99: %v \n",k, sampleCount, q.Query(0.0001),q.Query(0.50),q.Query(.90),q.Query(0.99),q.Query(0.9999))
     }
+    End := time.Since(start)
+    fmt.Fprintf(w, "\n Page Generated in %v\n", End)
  })
-}
-
-
-
-func helloWorldHandler(rw http.ResponseWriter, req *http.Request) {
-
- latestAndGreatest := pullID(req.Context())
-// whoami := latestAndGreatest["fancy"]
- rw.Header().Set("Content-Type", "text/plain; charset=utf-8") // normal header)
- rw.WriteHeader(http.StatusOK)
- for k,v := range(latestAndGreatest){
-   fmt.Fprintf(rw, "Hello World %v=%v\n",k,v)
- }
- io.WriteString(rw, "Goodbye 世界!\n")
 }
